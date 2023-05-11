@@ -40,8 +40,6 @@ function extractContentFromStreamData(stream) {
  * @return {Promise<string>}
  */
 async function requestCompletionsFromOpenAI(message, history, context, onStream) {
-  console.log(`requestCompletionsFromOpenAI: ${message}`);
-  console.log(`history: ${JSON.stringify(history, null, 2)}`);
   const key = context.openAIKeyFromContext();
   const body = {
     model: ENV.CHAT_MODEL,
@@ -49,6 +47,12 @@ async function requestCompletionsFromOpenAI(message, history, context, onStream)
     messages: [...(history || []), {role: 'user', content: message}],
     stream: onStream != null,
   };
+
+  const controller = new AbortController();
+  const {signal} = controller;
+  const timeout = 1000 * 60 * 5;
+  setTimeout(() => controller.abort(), timeout);
+
   let resp = await fetch(`${ENV.OPENAI_API_DOMAIN}/v1/chat/completions`, {
     method: 'POST',
     headers: {
@@ -56,9 +60,9 @@ async function requestCompletionsFromOpenAI(message, history, context, onStream)
       'Authorization': `Bearer ${key}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
-
-  if (onStream) {
+  if (onStream && resp.ok && resp.headers.get('content-type').indexOf('text/event-stream') !== -1) {
     const reader = resp.body.getReader({mode: 'byob'});
     const decoder = new TextDecoder('utf-8');
     let data = {done: false};
@@ -66,15 +70,21 @@ async function requestCompletionsFromOpenAI(message, history, context, onStream)
     let contentFull = '';
     let lengthDelta = 0;
     while (data.done === false) {
-      data = await reader.readAtLeast(4096, new Uint8Array(5000));
-      pendingText += decoder.decode(data.value);
-      const content = extractContentFromStreamData(pendingText);
-      pendingText = content.pending;
-      lengthDelta += content.content.length;
-      contentFull = contentFull + content.content;
-      if (lengthDelta > 20) {
-        lengthDelta = 0;
-        await onStream(contentFull);
+      try {
+        data = await reader.readAtLeast(4096, new Uint8Array(5000));
+        pendingText += decoder.decode(data.value);
+        const content = extractContentFromStreamData(pendingText);
+        pendingText = content.pending;
+        lengthDelta += content.content.length;
+        contentFull = contentFull + content.content;
+        if (lengthDelta > 20) {
+          lengthDelta = 0;
+          await onStream(contentFull);
+        }
+      } catch (e) {
+        contentFull += pendingText;
+        contentFull += `\n\n[ERROR]: ${e.message}\n\n`;
+        break;
       }
     }
     return contentFull;
@@ -100,7 +110,6 @@ async function requestCompletionsFromOpenAI(message, history, context, onStream)
  * @return {Promise<string>}
  */
 export async function requestImageFromOpenAI(prompt, context) {
-  console.log(`requestImageFromOpenAI: ${prompt}`);
   const key = context.openAIKeyFromContext();
   const body = {
     prompt: prompt,
@@ -131,12 +140,19 @@ export async function requestBill(context) {
   const apiUrl = ENV.OPENAI_API_DOMAIN;
   const key = context.openAIKeyFromContext();
 
-  const date = new Date();
-  const year = date.getFullYear();
-  const month = (date.getMonth() + 1).toString().padStart(2, '0');
-  const day = date.getDate().toString().padStart(2, '0');
-  const endDate = `${year}-${month}-${day}`;
-  const startDate = `${year}-${month}-01`;
+  const date2Cmp = (date) => {
+    const year = date.getFullYear();
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const day = date.getDate().toString().padStart(2, '0');
+    return {
+      year, month, day,
+    };
+  };
+
+  const start = date2Cmp(new Date());
+  const startDate = `${start.year}-${start.month}-01`;
+  const end = date2Cmp(new Date(Date.now() + 24 * 60 * 60 * 1000));
+  const endDate = `${end.year}-${end.month}-${end.day}`;
 
   const urlSub = `${apiUrl}/v1/dashboard/billing/subscription`;
   const urlUsage = `${apiUrl}/v1/dashboard/billing/usage?start_date=${startDate}&end_date=${endDate}`;
